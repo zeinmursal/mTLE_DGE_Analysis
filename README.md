@@ -1,15 +1,24 @@
 # mTLE_DGE_Analysis
-
-This repository performs a differential gene expression (DGE) analysis on the GSE134697 dataset, focusing on mesial temporal lobe epilepsy (mTLE) samples. The analysis compares gene expression between neocortex and hippocampus samples from 17 patients using R and DESeq2.
+Differential gene expression (DGE) analysis on the GSE134697 dataset, comparing neocortex and hippocampus samples in mesial temporal lobe epilepsy (mTLE) using R and DESeq2.
 
 ## Overview
-- **Goal**: Identify differentially expressed genes (DEGs) between neocortex and hippocampus in mTLE patients.
-- **Dataset**: [GSE134697](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE134697) from GEO.
-- **Tools**: R, DESeq2, ggplot2, pheatmap, dplyr, tidyr, tibble.
-- **Outputs**: Volcano plots, heatmaps, bar plots, and PCA plots for quality control.
+- **Goal**: Identify DEGs in mTLE patients.
+- **Dataset**: [GSE134697](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE134697).
+- **Tools**: R, DESeq2, ggplot2, pheatmap.
 
-## Requirements
-- **R**: Version 4.0.0 or higher.
-- **R Packages**: 
-  ```R
-  install.packages(c("readr", "DESeq2", "ggplot2", "pheatmap", "dplyr", "tidyr", "tibble"))
+## Setup
+1. Clone: `git clone https://github.com/zeinmursal/mTLE_DGE_Analysis.git`
+2. Place `GSE134697_CountMatrix.csv` in `data/` (download from GEO).
+3. Install R packages: `install.packages(c("readr", "DESeq2", "ggplot2", "pheatmap", "dplyr", "tidyr", "tibble"))`
+4. Set working directory: `setwd("C:/path/to/mTLE_DGE_Analysis")`
+5. Knit: `rmarkdown::render("scripts/mTLE_DGE_Analysis.Rmd")`
+
+## Results
+See [`mTLE_DGE_Analysis.html`](mTLE_DGE_Analysis.html) for the full report. Sample outputs in `output/`:
+- `volcano_patient_1.png`
+- `heatmap_significant_genes.png`
+- `deg_counts_per_patient.png`
+- `pca_plot.png`
+
+## License
+[MIT License](LICENSE)
