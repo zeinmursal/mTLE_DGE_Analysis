@@ -1,4 +1,4 @@
-# Transcriptomic Signatures of the Neocortex in Mesial Temporal Lobe Epilepsy with Synthetic Controls
+# Enhanced Differential Gene Expression Analysis of Mesial Temporal Lobe Epilepsy in Neocortex Using Synthetic Controls
 
 This repository contains an R-based pipeline for analyzing differential gene expression (DGE) in neocortex tissue of patients with mesial temporal lobe epilepsy (mTLE) using RNA-Seq count data from GEO dataset GSE134697. The study explores the impact of limited control sample sizes by incorporating synthetic control samples generated via negative binomial modeling. The pipeline includes preprocessing, DESeq2 statistical testing, visualization (PCA, volcano plots, heatmaps, and GO dotplots), and Gene Ontology (GO) enrichment for biological interpretation.
 
