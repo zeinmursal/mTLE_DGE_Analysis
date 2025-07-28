@@ -110,7 +110,9 @@ source("Script.R")
 If you use this repository or parts of it, please cite the original dataset and tools used:
 
 > Cagnan H, et al. "GSE134697 - RNA-seq of neocortex and hippocampus from mTLE patients." NCBI GEO (2019).
+
 > Love MI, Huber W, Anders S. Moderated estimation of fold change and dispersion for RNA-seq data with DESeq2. Genome Biology. 2014;15(12):550.
+
 > Yu G, Wang LG, Han Y, He QY. clusterProfiler: an R package for comparing biological themes among gene clusters. OMICS: A Journal of Integrative Biology. 2012;16(5):284-287.
 
 ---
