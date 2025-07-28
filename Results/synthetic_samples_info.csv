@@ -1,0 +1,4 @@
+"Sample_ID","Type","Generated_From","Method"
+"synthetic_control_1","Synthetic Control","Real control samples","Negative binomial simulation"
+"synthetic_control_2","Synthetic Control","Real control samples","Negative binomial simulation"
+"synthetic_control_3","Synthetic Control","Real control samples","Negative binomial simulation"

@@ -8,3 +8,13 @@
 .RData
 >>>>>>> c375541374e99ac63de7e673cd0fbd8d3c1c929d
 .RData
+# RStudio files
+.Rhistory
+.RData
+.Rproj.user/
+
+# Raw or intermediate files
+*.log
+*.tmp
+*.html
+/output/
