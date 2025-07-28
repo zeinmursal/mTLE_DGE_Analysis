@@ -1,0 +1,614 @@
+library(data.table)
+library(DESeq2)
+library(pheatmap)
+library(ggplot2)
+library(dplyr)
+library(clusterProfiler)
+library(enrichplot)
+library(org.Hs.eg.db)
+library(gridExtra)
+
+# Read count data
+counts <- fread("GSE134697_CountMatrix.tsv")
+full_counts <- read.delim("GSE134697_CountMatrix.tsv", skip = 1, header = TRUE)
+rownames(full_counts) <- full_counts$Geneid # Set gene IDs as row names
+count_data <- full_counts[, 7:ncol(full_counts)]
+
+# ------------------------
+# Read the metadata file
+# ------------------------
+
+metadata <- read.csv("GSE134697_metadata.csv", row.names = 1) # Metadata csv was generated from a GSE134697_series_matrix file.
+coldata <- metadata[, (ncol(metadata)-2):ncol(metadata)]  # Set last two columns as condition and tissue
+colnames(count_data) <- rownames(coldata)
+
+all(colnames(count_data) == rownames(coldata))  # should return TRUE
+
+# Ensure that the condition and tissue columns are factors
+n <- nrow(coldata)  # total number of samples
+coldata$individual.ch1[(n-1):n] <- c("CTRL01", "CTRL02")
+coldata$patient_id <- factor(coldata$individual.ch1)
+coldata$condition <- factor(coldata$condition.ch1, levels = c("without epilepsy", "mesial temporal lobe epilepsy"))
+coldata$tissue <- factor(coldata$tissue.ch1, levels = c("Neocortex", "Hippocampus"))
+
+# Drop empty levels in 'condition' and 'tissue' columns
+coldata$condition <- droplevels(coldata$condition)
+coldata$tissue <- droplevels(coldata$tissue)
+coldata$patient_id <- droplevels(coldata$patient_id)
+
+# CLEANING Remove Genes with zero counts
+count_data <- count_data[rowSums(count_data) > 0, ]
+
+# ----------------------------
+# Subset Neocortex Samples & Run DESeq2
+# ----------------------------
+
+# Subset neocortex samples based on metadata
+neocortex_samples <- rownames(coldata)[coldata$tissue == "Neocortex"]
+
+# Subset count data and metadata
+count_data_neocortex <- count_data[, neocortex_samples]
+coldata_neocortex <- coldata[neocortex_samples, ]
+
+# Construct DESeq2 dataset
+dds_neocortex <- DESeqDataSetFromMatrix(
+  countData = count_data_neocortex,
+  colData = coldata_neocortex,
+  design = ~ condition
+)
+
+# Filter out low count genes
+dds_neocortex <- dds_neocortex[rowSums(counts(dds_neocortex)) >= 10, ]
+
+# Run DESeq2 pipeline (this includes normalization, dispersion estimation, etc.)
+dds_neocortex <- DESeq(dds_neocortex)
+
+# Optional: Check results
+res_neocortex <- results(dds_neocortex, contrast = c("condition", "mesial temporal lobe epilepsy", "without epilepsy"))
+plotDispEsts(dds_neocortex)
+
+# ----------------------------
+# Generate Synthetic Control Samples
+# ----------------------------
+
+# Identify real neocortex controls
+control_samples <- rownames(coldata_neocortex)[coldata_neocortex$condition == "without epilepsy"]
+control_counts <- counts(dds_neocortex)[, control_samples]
+
+# Get dispersions
+dispersion_by_gene <- dispersions(dds_neocortex)
+
+# Function to simulate synthetic control samples with better error handling
+simulate_synthetic_control <- function(control_counts, dispersions, sample_name) {
+  # Ensure inputs are valid
+  if (nrow(control_counts) == 0 || length(dispersions) == 0) {
+    stop("Empty input data for synthetic control generation")
+  }
+  
+  # Ensure dispersions match the number of genes
+  if (length(dispersions) != nrow(control_counts)) {
+    warning("Dispersions length doesn't match gene count, using available dispersions")
+    dispersions <- dispersions[1:min(length(dispersions), nrow(control_counts))]
+  }
+  
+  synthetic_control <- numeric(nrow(control_counts))
+  names(synthetic_control) <- rownames(control_counts)
+  
+  for (i in seq_len(nrow(control_counts))) {
+    # Calculate mean, handling potential NAs
+    mu <- mean(control_counts[i, ], na.rm = TRUE)
+    
+    # Handle edge cases
+    if (is.na(mu) || mu <= 0) {
+      mu <- 1  # Set minimum value
+    }
+    
+    # Get dispersion for this gene
+    disp <- ifelse(i <= length(dispersions), dispersions[i], dispersions[length(dispersions)])
+    
+    # Handle dispersion edge cases
+    if (is.na(disp) || disp <= 0) {
+      disp <- 0.1  # Set reasonable default
+    }
+    
+    size_param <- 1/disp
+    
+    # Generate synthetic count
+    synthetic_control[i] <- rnbinom(1, mu = mu, size = size_param)
+  }
+  
+  return(synthetic_control)
+}
+
+# Check if we have control samples and valid dispersions
+if (length(control_samples) == 0) {
+  stop("No control samples found in neocortex data")
+}
+
+print(paste("Number of control samples found:", length(control_samples)))
+print(paste("Number of genes after filtering:", nrow(control_counts)))
+
+# Verify dispersions are available
+if (length(dispersion_by_gene) == 0) {
+  stop("No dispersions available from DESeq2 analysis")
+}
+
+print(paste("Number of dispersions available:", length(dispersion_by_gene)))
+
+# Generate multiple synthetic control samples (e.g., 2 samples)
+n_synthetic <- 3
+synthetic_samples <- list()
+synthetic_names <- paste0("synthetic_control_", 1:n_synthetic)
+
+set.seed(123)  # For reproducibility
+for (i in 1:n_synthetic) {
+  cat("Generating synthetic sample", i, "of", n_synthetic, "\n")
+  synthetic_samples[[i]] <- simulate_synthetic_control(control_counts, dispersion_by_gene, synthetic_names[i])
+}
+
+# Combine synthetic samples into a matrix
+synthetic_matrix <- do.call(cbind, synthetic_samples)
+colnames(synthetic_matrix) <- synthetic_names
+
+# Verify dimensions match
+print(paste("Original counts matrix dimensions:", nrow(counts(dds_neocortex)), "x", ncol(counts(dds_neocortex))))
+print(paste("Synthetic matrix dimensions:", nrow(synthetic_matrix), "x", ncol(synthetic_matrix)))
+
+# Add synthetic samples to counts matrix
+counts_with_synth <- cbind(counts(dds_neocortex), synthetic_matrix)
+
+# Create metadata for synthetic samples with proper factor levels
+synth_coldata_list <- list()
+for (i in 1:n_synthetic) {
+  synth_coldata_list[[i]] <- data.frame(
+    condition.ch1 = as.character(NA),
+    individual.ch1 = as.character(NA), 
+    tissue.ch1 = as.character(NA),
+    patient_id = factor(paste0("SYNTH", sprintf("%02d", i)), levels = c(levels(coldata_neocortex$patient_id), paste0("SYNTH", sprintf("%02d", 1:n_synthetic)))),
+    condition = factor("without epilepsy", levels = levels(coldata_neocortex$condition)),
+    tissue = factor("Neocortex", levels = levels(coldata_neocortex$tissue)),
+    row.names = synthetic_names[i],
+    stringsAsFactors = FALSE
+  )
+}
+
+# Combine synthetic metadata
+synth_coldata_combined <- do.call(rbind, synth_coldata_list)
+
+# Ensure factor levels are consistent before combining
+# Update patient_id levels in original data to include synthetic ones
+coldata_neocortex$patient_id <- factor(coldata_neocortex$patient_id, 
+                                       levels = c(levels(coldata_neocortex$patient_id), 
+                                                  paste0("SYNTH", sprintf("%02d", 1:n_synthetic))))
+
+# Ensure columns are in the same order as coldata_neocortex
+synth_coldata_combined <- synth_coldata_combined[, colnames(coldata_neocortex), drop = FALSE]
+
+# Verify column compatibility
+print("Original coldata structure:")
+str(coldata_neocortex)
+print("Synthetic coldata structure:")
+str(synth_coldata_combined)
+
+coldata_with_synth <- rbind(coldata_neocortex, synth_coldata_combined)
+
+print(paste("Combined metadata dimensions:", nrow(coldata_with_synth), "x", ncol(coldata_with_synth)))
+print(paste("Number of samples in count matrix:", ncol(counts_with_synth)))
+print(paste("Number of samples in metadata:", nrow(coldata_with_synth)))
+
+# ----------------------------
+# DESeq2 Analysis with Synthetic Controls
+# ----------------------------
+
+# Create a new DESeq2 object including the synthetic controls
+# Verify sample names match between count matrix and metadata
+if (!all(colnames(counts_with_synth) == rownames(coldata_with_synth))) {
+  stop("Sample names don't match between count matrix and metadata")
+}
+
+dds_with_synth <- DESeqDataSetFromMatrix(
+  countData = counts_with_synth,
+  colData = coldata_with_synth,
+  design = ~ condition
+)
+
+print("DESeq2 object created successfully")
+print(paste("DESeq2 object dimensions:", nrow(dds_with_synth), "genes x", ncol(dds_with_synth), "samples"))
+
+dds_with_synth <- dds_with_synth[rowSums(counts(dds_with_synth)) >= 10, ]
+print(paste("After filtering low counts:", nrow(dds_with_synth), "genes remaining"))
+
+dds_with_synth <- DESeq(dds_with_synth)
+print("DESeq2 analysis completed")
+
+res_with_synth <- results(dds_with_synth, contrast = c("condition", "mesial temporal lobe epilepsy", "without epilepsy"))
+print("Results extracted successfully")
+
+# ----------------------------
+# Visualization with Synthetic Data
+# ----------------------------
+
+# Create a directory for plots if it doesn't exist
+if (!dir.exists("plots")) {
+  dir.create("plots")
+}
+
+# PCA Plot
+vsd <- vst(dds_with_synth, blind = FALSE)
+pca_plot <- plotPCA(vsd, intgroup = "condition") + 
+  ggtitle("PCA Plot: Neocortex Samples (with Synthetic Controls)")
+ggsave("plots/pca_plot_synthetic.png", plot = pca_plot, width = 10, height = 8, dpi = 300)
+
+# Heatmap of top variable genes
+topVarGenes <- head(order(rowVars(assay(vsd)), decreasing=TRUE), 30)
+
+# Select only relevant annotation columns
+annotation_cols <- c("condition", "tissue")
+annotation_df <- as.data.frame(colData(vsd))[, annotation_cols, drop = FALSE]
+
+# Save heatmap of top variable genes
+png("plots/top_variable_genes_heatmap_synthetic.png", width = 12, height = 10, units = "in", res = 300)
+pheatmap(assay(vsd)[topVarGenes, ], 
+         annotation_col = annotation_df,
+         cluster_rows = TRUE,
+         cluster_cols = TRUE,
+         show_colnames = TRUE,
+         main = "Top 30 Variable Genes (with Synthetic Controls)")
+dev.off()
+
+# Heatmap of top significant genes
+png("plots/top_significant_genes_heatmap_synthetic.png", width = 12, height = 10, units = "in", res = 300)
+pheatmap(assay(vsd)[head(order(res_with_synth$padj), 20), ], 
+         cluster_rows = TRUE, 
+         cluster_cols = TRUE, 
+         annotation_col = annotation_df,
+         show_colnames = TRUE,
+         main = "Top 20 Significant Genes (with Synthetic Controls)")
+dev.off()
+
+# Volcano Plot
+res_df_synth <- as.data.frame(res_with_synth)
+res_df_synth$gene <- rownames(res_df_synth)
+# Handle any NA values in padj for plotting
+res_df_synth$padj[is.na(res_df_synth$padj)] <- 1
+
+# Define significance based on thresholds
+res_df_synth$significance <- "Not Sig"
+res_df_synth$significance[res_df_synth$padj < 0.05 & abs(res_df_synth$log2FoldChange) > 1] <- "Significant"
+
+# Plot volcano plot
+volcano_plot <- ggplot(res_df_synth, aes(x = log2FoldChange, y = -log10(padj))) +
+  geom_point(aes(color = significance), alpha = 0.6) +
+  scale_color_manual(values = c("Not Sig" = "blue", "Significant" = "red")) +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed", color = "darkgrey") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "darkgrey") +
+  labs(title = "Volcano Plot: Neocortex (Epilepsy vs Control, with Synthetic Controls)",
+       x = "log2 Fold Change",
+       y = "-log10 Adjusted P-value") +
+  theme_minimal()
+ggsave("plots/volcano_plot_synthetic.png", plot = volcano_plot, width = 10, height = 8, dpi = 300)
+
+# ----------------------------
+# Gene Enrichment Analysis
+# ----------------------------
+
+# Extract significant genes
+sig_genes_up <- filter(res_df_synth, padj < 0.05, log2FoldChange > 1) %>% pull(gene)
+sig_genes_down <- filter(res_df_synth, padj < 0.05, log2FoldChange < -1) %>% pull(gene)
+
+print(paste("Number of upregulated genes:", length(sig_genes_up)))
+print(paste("Number of downregulated genes:", length(sig_genes_down)))
+
+# Gene Ontology enrichment analysis - Upregulated genes
+if (length(sig_genes_up) > 0) {
+  ego_up <- enrichGO(gene          = sig_genes_up,
+                     OrgDb         = org.Hs.eg.db,
+                     keyType       = "ENSEMBL",
+                     ont           = "BP",
+                     pAdjustMethod = "BH",
+                     pvalueCutoff  = 0.05,
+                     qvalueCutoff  = 0.2,
+                     readable      = TRUE)
+  
+  # Plot dotplot for upregulated genes
+  up_dotplot <- dotplot(ego_up, showCategory=10) + ggtitle("GO Enrichment - Upregulated Genes (with Synthetic)")
+  ggsave("plots/GO_enrichment_upregulated_dotplot_synthetic.png", plot = up_dotplot, width = 12, height = 8, dpi = 300)
+}
+
+# Gene Ontology enrichment analysis - Downregulated genes
+if (length(sig_genes_down) > 0) {
+  ego_down <- enrichGO(gene          = sig_genes_down,
+                       OrgDb         = org.Hs.eg.db,
+                       keyType       = "ENSEMBL",
+                       ont           = "BP",
+                       pAdjustMethod = "BH",
+                       pvalueCutoff  = 0.1,  # Relaxed threshold
+                       qvalueCutoff  = 0.2,
+                       readable      = TRUE)
+  
+  # Plot dotplot for downregulated genes
+  down_dotplot <- dotplot(ego_down, showCategory=10) + ggtitle("GO Enrichment - Downregulated Genes (with Synthetic)")
+  ggsave("plots/GO_enrichment_downregulated_dotplot_synthetic.png", plot = down_dotplot, width = 12, height = 8, dpi = 300)
+}
+
+# Network plots if enrichment results exist
+if (exists("ego_up") && !is.null(ego_up) && nrow(ego_up) > 0) {
+  # Prepare gene list for network plot
+  gene_list <- res_df_synth$log2FoldChange
+  names(gene_list) <- res_df_synth$gene
+  
+  p1 <- cnetplot(ego_up, showCategory=10, foldChange=gene_list) + 
+    ggtitle("Upregulated GO Terms (with Synthetic)")
+  ggsave("plots/GO_network_upregulated_synthetic.png", plot = p1, width = 12, height = 10, dpi = 300)
+  
+  if (exists("ego_down") && !is.null(ego_down) && nrow(ego_down) > 0) {
+    p2 <- cnetplot(ego_down, showCategory=10, foldChange=gene_list) + 
+      ggtitle("Downregulated GO Terms (with Synthetic)")
+    ggsave("plots/GO_network_downregulated_synthetic.png", plot = p2, width = 12, height = 10, dpi = 300)
+    
+    # Combined network plot
+    combined_network <- grid.arrange(p1, p2, ncol=2)
+    ggsave("plots/GO_network_combined_synthetic.png", plot = combined_network, width = 20, height = 10, dpi = 300)
+  }
+}
+
+# ----------------------------
+# Comparison Analysis
+# ----------------------------
+
+# Compare results with and without synthetic controls
+print("=== COMPARISON: Original vs Synthetic-Enhanced Analysis ===")
+
+# Number of significant genes
+sig_original <- sum(res_neocortex$padj < 0.05 & abs(res_neocortex$log2FoldChange) > 1, na.rm = TRUE)
+sig_synthetic <- sum(res_with_synth$padj < 0.05 & abs(res_with_synth$log2FoldChange) > 1, na.rm = TRUE)
+
+print(paste("Significant genes (original):", sig_original))
+print(paste("Significant genes (with synthetic):", sig_synthetic))
+
+# Create comparison plot
+comparison_data <- data.frame(
+  Analysis = c("Original", "With Synthetic"),
+  Significant_Genes = c(sig_original, sig_synthetic)
+)
+
+comparison_plot <- ggplot(comparison_data, aes(x = Analysis, y = Significant_Genes, fill = Analysis)) +
+  geom_bar(stat = "identity") +
+  geom_text(aes(label = Significant_Genes), vjust = -0.5) +
+  labs(title = "Comparison: Significant Genes Found",
+       y = "Number of Significant Genes",
+       x = "Analysis Type") +
+  theme_minimal() +
+  theme(legend.position = "none")
+ggsave("plots/comparison_significant_genes_synthetic.png", plot = comparison_plot, width = 8, height = 6, dpi = 300)
+
+# ----------------------------
+# Additional Plots from DESeq2
+# ----------------------------
+
+# Dispersion plot
+png("plots/dispersion_plot_synthetic.png", width = 10, height = 8, units = "in", res = 300)
+plotDispEsts(dds_with_synth)
+dev.off()
+
+# MA plot
+png("plots/MA_plot_synthetic.png", width = 10, height = 8, units = "in", res = 300)
+plotMA(res_with_synth, main = "MA Plot: Neocortex (with Synthetic Controls)")
+dev.off()
+
+# ----------------------------
+# Save Results
+# ----------------------------
+
+# Save DESeq2 results
+write.csv(res_df_synth, "res_neocortex_with_synthetic.csv", row.names = FALSE)
+write.csv(subset(res_df_synth, padj < 0.05), "significant_genes_neocortex_synthetic.csv", row.names = FALSE)
+
+# Save synthetic sample information
+synthetic_info <- data.frame(
+  Sample_ID = synthetic_names,
+  Type = "Synthetic Control",
+  Generated_From = "Real control samples",
+  Method = "Negative binomial simulation"
+)
+write.csv(synthetic_info, "synthetic_samples_info.csv", row.names = FALSE)
+
+# Save enrichment results if they exist
+if (exists("ego_up") && !is.null(ego_up)) {
+  write.csv(as.data.frame(ego_up), "GO_enrichment_upregulated_synthetic.csv", row.names = FALSE)
+}
+
+if (exists("ego_down") && !is.null(ego_down)) {
+  write.csv(as.data.frame(ego_down), "GO_enrichment_downregulated_synthetic.csv", row.names = FALSE)
+}
+
+# Save comparison summary
+comparison_summary <- data.frame(
+  Metric = c("Total samples (original)", "Total samples (with synthetic)", 
+             "Control samples (original)", "Control samples (with synthetic)",
+             "Significant genes (original)", "Significant genes (with synthetic)"),
+  Value = c(ncol(count_data_neocortex), ncol(counts_with_synth),
+            length(control_samples), length(control_samples) + n_synthetic,
+            sig_original, sig_synthetic)
+)
+write.csv(comparison_summary, "analysis_comparison_summary.csv", row.names = FALSE)
+
+print("=== Analysis completed! Results saved to CSV files. ===")
+print("Files generated:")
+print("- res_neocortex_with_synthetic.csv")
+print("- significant_genes_neocortex_synthetic.csv") 
+print("- synthetic_samples_info.csv")
+print("- GO_enrichment_upregulated_synthetic.csv")
+print("- GO_enrichment_downregulated_synthetic.csv")
+print("- analysis_comparison_summary.csv")
+print("")
+print("Plots saved to 'plots' directory:")
+print("- pca_plot_synthetic.png")
+print("- top_variable_genes_heatmap_synthetic.png")
+print("top_significant_genes_heatmap_synthetic.png")
+print("- volcano_plot_synthetic.png")
+print("- GO_enrichment_upregulated_dotplot_synthetic.png")
+print("- GO_enrichment_downregulated_dotplot_synthetic.png")
+print("- GO_network_upregulated_synthetic.png")
+print("- GO_network_downregulated_synthetic.png")
+print("- GO_network_combined_synthetic.png")
+print("- comparison_significant_genes_synthetic.png")
+print("- dispersion_plot_synthetic.png")
+print("- MA_plot_synthetic.png")
+
+# ----------------------------
+# Enhanced DEG Analysis with Effect Size Metrics
+# ----------------------------
+
+# Prepare results dataframes
+res_df_original <- as.data.frame(res_neocortex)
+res_df_original$gene <- rownames(res_df_original)
+res_df_original$padj[is.na(res_df_original$padj)] <- 1
+
+res_df_synth <- as.data.frame(res_with_synth)
+res_df_synth$gene <- rownames(res_df_synth)
+res_df_synth$padj[is.na(res_df_synth$padj)] <- 1
+
+# Define significance thresholds
+padj_threshold <- 0.05
+lfc_threshold <- 1
+
+# Extract DEGs for both analyses
+degs_original <- res_df_original[res_df_original$padj < padj_threshold & 
+                                   abs(res_df_original$log2FoldChange) > lfc_threshold, ]
+degs_original <- degs_original[!is.na(degs_original$log2FoldChange), ]
+
+degs_synth <- res_df_synth[res_df_synth$padj < padj_threshold & 
+                             abs(res_df_synth$log2FoldChange) > lfc_threshold, ]
+degs_synth <- degs_synth[!is.na(degs_synth$log2FoldChange), ]
+
+# ----------------------------
+# Effect Size Analysis - DEG Counts with Median log2FC
+# ----------------------------
+
+print("=== DEG COUNTS WITH EFFECT SIZE ANALYSIS ===")
+
+# Calculate median log2 fold changes for DEGs
+median_lfc_original <- median(abs(degs_original$log2FoldChange), na.rm = TRUE)
+median_lfc_synth <- median(abs(degs_synth$log2FoldChange), na.rm = TRUE)
+
+# Print DEG counts with median effect sizes
+cat("\n--- DEG Counts with Effect Size ---\n")
+cat("Original Analysis:\n")
+cat(paste("  DEGs count:", nrow(degs_original), "\n"))
+cat(paste("  Median |log2FC|:", round(median_lfc_original, 3), "\n"))
+
+cat("\nWith Synthetic Controls:\n")
+cat(paste("  DEGs count:", nrow(degs_synth), "\n"))
+cat(paste("  Median |log2FC|:", round(median_lfc_synth, 3), "\n"))
+
+# ----------------------------
+# Effect Size Distribution Visualizations
+# ----------------------------
+
+# Create a directory for plots if it doesn't exist
+if (!dir.exists("plots")) {
+  dir.create("plots")
+}
+
+# 1. Histogram of log2 fold change distributions
+create_lfc_histogram <- function(degs_data, title_suffix) {
+  ggplot(degs_data, aes(x = log2FoldChange)) +
+    geom_histogram(bins = 30, fill = "steelblue", alpha = 0.7, color = "black") +
+    geom_vline(xintercept = median(degs_data$log2FoldChange, na.rm = TRUE), 
+               color = "red", linetype = "dashed", size = 1) +
+    geom_vline(xintercept = 0, color = "black", linetype = "solid", size = 0.5) +
+    labs(title = paste("Distribution of log2 Fold Changes -", title_suffix),
+         subtitle = paste("Median log2FC:", round(median(degs_data$log2FoldChange, na.rm = TRUE), 3)),
+         x = "log2 Fold Change",
+         y = "Frequency") +
+    theme_minimal() +
+    theme(plot.title = element_text(hjust = 0.5),
+          plot.subtitle = element_text(hjust = 0.5, color = "red"))
+}
+
+# Create histograms for each analysis
+if (nrow(degs_original) > 0) {
+  hist_original <- create_lfc_histogram(degs_original, "Original Analysis")
+  ggsave("plots/lfc_histogram_original.png", plot = hist_original, 
+         width = 10, height = 6, dpi = 300)
+}
+
+if (nrow(degs_synth) > 0) {
+  hist_synth <- create_lfc_histogram(degs_synth, "With Synthetic Controls")
+  ggsave("plots/lfc_histogram_synthetic.png", plot = hist_synth, 
+         width = 10, height = 6, dpi = 300)
+}
+
+# 2. Boxplot comparison of log2 fold change distributions
+if (nrow(degs_original) > 0 && nrow(degs_synth) > 0) {
+  # Combine data for comparison
+  comparison_data <- rbind(
+    data.frame(log2FoldChange = degs_original$log2FoldChange, 
+               Analysis = "Original", 
+               AbsLog2FC = abs(degs_original$log2FoldChange)),
+    data.frame(log2FoldChange = degs_synth$log2FoldChange, 
+               Analysis = "With Synthetic", 
+               AbsLog2FC = abs(degs_synth$log2FoldChange))
+  )
+  
+  # Boxplot of log2 fold changes (signed)
+  boxplot_signed <- ggplot(comparison_data, aes(x = Analysis, y = log2FoldChange, fill = Analysis)) +
+    geom_boxplot(alpha = 0.7) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+    stat_summary(fun = median, geom = "point", shape = 23, size = 3, fill = "red") +
+    labs(title = "Comparison of log2 Fold Change Distributions",
+         subtitle = "Red diamonds indicate medians",
+         x = "Analysis Type",
+         y = "log2 Fold Change") +
+    theme_minimal() +
+    theme(plot.title = element_text(hjust = 0.5),
+          plot.subtitle = element_text(hjust = 0.5),
+          legend.position = "none") +
+    scale_fill_manual(values = c("Original" = "lightblue", "With Synthetic" = "lightcoral"))
+  
+  ggsave("plots/lfc_boxplot_comparison.png", plot = boxplot_signed, 
+         width = 8, height = 6, dpi = 300)
+  
+  # Boxplot of absolute log2 fold changes (effect magnitude)
+  boxplot_abs <- ggplot(comparison_data, aes(x = Analysis, y = AbsLog2FC, fill = Analysis)) +
+    geom_boxplot(alpha = 0.7) +
+    stat_summary(fun = median, geom = "point", shape = 23, size = 3, fill = "red") +
+    labs(title = "Comparison of Effect Size Magnitudes",
+         subtitle = "Absolute log2 Fold Changes - Red diamonds indicate medians",
+         x = "Analysis Type",
+         y = "|log2 Fold Change|") +
+    theme_minimal() +
+    theme(plot.title = element_text(hjust = 0.5),
+          plot.subtitle = element_text(hjust = 0.5),
+          legend.position = "none") +
+    scale_fill_manual(values = c("Original" = "lightblue", "With Synthetic" = "lightcoral"))
+  
+  ggsave("plots/effect_size_boxplot_comparison.png", plot = boxplot_abs, 
+         width = 8, height = 6, dpi = 300)
+}
+
+# ----------------------------
+# Save DEG Effect Size Results
+# ----------------------------
+
+# Create summary table
+deg_effect_summary <- data.frame(
+  Analysis = c("Original", "With Synthetic"),
+  DEG_Count = c(nrow(degs_original), nrow(degs_synth)),
+  Median_Abs_Log2FC = c(round(median_lfc_original, 3), round(median_lfc_synth, 3))
+)
+
+# Save the summary
+write.csv(deg_effect_summary, "DEG_counts_with_effect_sizes.csv", row.names = FALSE)
+
+# Print summary
+print("=== DEG EFFECT SIZE SUMMARY ===")
+print(deg_effect_summary)
+
+print("Generated files:")
+print("- DEG_counts_with_effect_sizes.csv")
+print("- plots/lfc_histogram_original.png")
+print("- plots/lfc_histogram_synthetic.png") 
+print("- plots/lfc_boxplot_comparison.png")
+print("- plots/effect_size_boxplot_comparison.png")
